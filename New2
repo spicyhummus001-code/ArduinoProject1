@@ -1,0 +1,926 @@
+/*
+  ESP32 combined sketch (patched)
+  - Web UI: interactive color wheel, brightness, presets
+  - Temp/humidity display (DHT11) + I2C LCD
+  - High-humidity alarm (buzzer task + flashing UI)
+  - NeoPixel control and RGB "dance" while playing songs
+  - Local song parser: accepts NOTE_* , value notation (your provided sequence)
+  - Servo on IO18 dances dramatically with the beat
+  - Endpoints: /, /api/readings, /api/color, /api/brightness, /api/playlocal, /api/stoplocal, /api/led/toggle, /api/toggle, /api/buzzer
+  Replace WIFI_SSID and WIFI_PASS before uploading.
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <dht11.h>
+#include <Adafruit_NeoPixel.h>
+#include <BuzzerESP32.h>
+#include <ESP32Servo.h>   // Servo support for ESP32
+
+// ---------- User config ----------
+const char* WIFI_SSID = "ThisNetwork";
+const char* WIFI_PASS = "WifiPassword123.";
+// ---------------------------------
+
+// Hardware pins
+const int DHT11PIN = 17;
+dht11 DHT11;
+
+const int BUTTON_PIN = 27;
+const int I2C_SDA = 21;
+const int I2C_SCL = 22;
+
+LiquidCrystal_I2C mylcd(0x27, 16, 2);
+
+// NeoPixel
+#define LED_PIN 26
+#define NUM_LEDS 4
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Buzzer
+const int BUZZER_PIN = 25;
+BuzzerESP32 buzzer(BUZZER_PIN);
+
+// Servo
+const int SERVO_PIN = 18;
+Servo beatServo;
+bool servoAttached = false;
+
+// Web server
+WebServer server(80);
+
+// ------------------- RAW NOTATION -------------------
+String rawNotation = ...
+
+// ---------------- LYRIC SENTENCES (YOU FILL THESE IN) ----------------
+const char* lyricLines[] = {
+    "LYRIC 1",
+    "LYRIC 2",
+    "LYRIC 3",
+    "LYRIC 4",
+    "LYRIC 5",
+    // Add more as needed — one per pause in the song
+};
+
+int lyricIndex = 0;
+String currentLyric = "";
+int scrollPos = 0;
+unsigned long lastScrollTime = 0;
+
+// State and timing
+bool showFahrenheit = true;
+unsigned long lastSensorMs = 0;
+const unsigned long SENSOR_INTERVAL = 1500; // ms
+
+// Button debounce
+const unsigned long DEBOUNCE_MS = 50;
+bool buttonStableState = HIGH;
+bool buttonLastRead = HIGH;
+unsigned long buttonLastChangeMs = 0;
+
+// Readings
+float lastTempC = NAN;
+float lastHum = NAN;
+
+// LED state
+bool ledsOn = false;
+uint8_t currentR = 255, currentG = 255, currentB = 255; // default white
+uint8_t currentBrightness = 150; // 0-255
+
+// Alarm
+volatile bool alarmActive = false;
+TaskHandle_t alarmTaskHandle = NULL;
+const float HUMIDITY_THRESHOLD = 60.0f;
+
+// ---------- Local song parsing (NOTE_* mapping and raw notation) ----------
+// NOTE frequency table (from your list)
+#define NOTE_B0  31
+#define NOTE_C1  33
+#define NOTE_CS1 35
+#define NOTE_D1  37
+#define NOTE_DS1 39
+#define NOTE_E1  41
+#define NOTE_F1  44
+#define NOTE_FS1 46
+#define NOTE_G1  49
+#define NOTE_GS1 52
+#define NOTE_A1  55
+#define NOTE_AS1 58
+#define NOTE_B1  62
+#define NOTE_C2  65
+#define NOTE_CS2 69
+#define NOTE_D2  73
+#define NOTE_DS2 78
+#define NOTE_E2  82
+#define NOTE_F2  87
+#define NOTE_FS2 93
+#define NOTE_G2  98
+#define NOTE_GS2 104
+#define NOTE_A2  110
+#define NOTE_AS2 117
+#define NOTE_B2  123
+#define NOTE_C3  131
+#define NOTE_CS3 139
+#define NOTE_D3  147
+#define NOTE_DS3 156
+#define NOTE_E3  165
+#define NOTE_F3  175
+#define NOTE_FS3 185
+#define NOTE_G3  196
+#define NOTE_GS3 208
+#define NOTE_A3  220
+#define NOTE_AS3 233
+#define NOTE_B3  247
+#define NOTE_C4  262
+#define NOTE_CS4 277
+#define NOTE_D4  294
+#define NOTE_DS4 311
+#define NOTE_E4  330
+#define NOTE_F4  349
+#define NOTE_FS4 370
+#define NOTE_G4  392
+#define NOTE_GS4 415
+#define NOTE_A4  440
+#define NOTE_AS4 466
+#define NOTE_B4  494
+#define NOTE_C5  523
+#define NOTE_CS5 554
+#define NOTE_D5  587
+#define NOTE_DS5 622
+#define NOTE_E5  659
+#define NOTE_F5  698
+#define NOTE_FS5 740
+#define NOTE_G5  784
+#define NOTE_GS5 831
+#define NOTE_A5  880
+#define NOTE_AS5 932
+#define NOTE_B5  988
+#define NOTE_C6  1047
+#define NOTE_CS6 1109
+#define NOTE_D6  1175
+#define NOTE_DS6 1245
+#define NOTE_E6  1319
+#define NOTE_F6  1397
+#define NOTE_FS6 1480
+#define NOTE_G6  1568
+#define NOTE_GS6 1661
+#define NOTE_A6  1760
+#define NOTE_AS6 1865
+#define NOTE_B6  1976
+#define NOTE_C7  2093
+#define NOTE_CS7 2217
+#define NOTE_D7  2349
+#define NOTE_DS7 2489
+#define NOTE_E7  2637
+#define NOTE_F7  2794
+#define NOTE_FS7 2960
+#define NOTE_G7  3136
+#define NOTE_GS7 3322
+#define NOTE_A7  3520
+#define NOTE_AS7 3729
+#define NOTE_B7  3951
+#define NOTE_C8  4186
+#define NOTE_CS8 4435
+#define NOTE_D8  4699
+#define NOTE_DS8 4978
+#define REST      0
+
+int tempo = 225; // Adjusted tempo to compensate for BuzzerESP32 library overhead
+
+// The raw notation you provided (exact)
+const char* rawNotation = R"NOTES(
+NOTE_D5,-4, NOTE_E5,-4, NOTE_A4,4, //1
+  NOTE_E5,-4, NOTE_FS5,-4, NOTE_A5,16, NOTE_G5,16, NOTE_FS5,8,
+  NOTE_D5,-4, NOTE_E5,-4, NOTE_A4,2,
+  NOTE_A4,16, NOTE_A4,16, NOTE_B4,16, NOTE_D5,8, NOTE_D5,16,
+  NOTE_D5,-4, NOTE_E5,-4, NOTE_A4,4, //repeat from 1
+  NOTE_E5,-4, NOTE_FS5,-4, NOTE_A5,16, NOTE_G5,16, NOTE_FS5,8,
+  NOTE_D5,-4, NOTE_E5,-4, NOTE_A4,2,
+  NOTE_A4,16, NOTE_A4,16, NOTE_B4,16, NOTE_D5,8, NOTE_D5,16,
+  REST,4, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_D5,8, NOTE_E5,8, NOTE_CS5,-8,
+  NOTE_B4,16, NOTE_A4,2, REST,4, 
+
+  REST,8, NOTE_B4,8, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,4, NOTE_A4,8, //7
+  NOTE_A5,8, REST,8, NOTE_A5,8, NOTE_E5,-4, REST,4, 
+  NOTE_B4,8, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,8, NOTE_D5,8, NOTE_E5,8, REST,8,
+  REST,8, NOTE_CS5,8, NOTE_B4,8, NOTE_A4,-4, REST,4,
+  REST,8, NOTE_B4,8, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,8, NOTE_A4,4,
+  NOTE_E5,8, NOTE_E5,8, NOTE_E5,8, NOTE_FS5,8, NOTE_E5,4, REST,4,
+   
+  NOTE_D5,2, NOTE_E5,8, NOTE_FS5,8, NOTE_D5,8, //13
+  NOTE_E5,8, NOTE_E5,8, NOTE_E5,8, NOTE_FS5,8, NOTE_E5,4, NOTE_A4,4,
+  REST,2, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,8,
+  REST,8, NOTE_E5,8, NOTE_FS5,8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_FS5,-8, NOTE_FS5,-8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+
+  NOTE_E5,-8, NOTE_E5,-8, NOTE_D5,-8, NOTE_CS5,16, NOTE_B4,-8, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16, //18
+  NOTE_D5,4, NOTE_E5,8, NOTE_CS5,-8, NOTE_B4,16, NOTE_A4,8, NOTE_A4,8, NOTE_A4,8, 
+  NOTE_E5,4, NOTE_D5,2, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_FS5,-8, NOTE_FS5,-8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_A5,4, NOTE_CS5,8, NOTE_D5,-8, NOTE_CS5,16, NOTE_B4,8, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+
+  NOTE_D5,4, NOTE_E5,8, NOTE_CS5,-8, NOTE_B4,16, NOTE_A4,4, NOTE_A4,8,  //23
+  NOTE_E5,4, NOTE_D5,2, REST,4,
+  REST,8, NOTE_B4,8, NOTE_D5,8, NOTE_B4,8, NOTE_D5,8, NOTE_E5,4, REST,8,
+  REST,8, NOTE_CS5,8, NOTE_B4,8, NOTE_A4,-4, REST,4,
+  REST,8, NOTE_B4,8, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,8, NOTE_A4,4,
+  REST,8, NOTE_A5,8, NOTE_A5,8, NOTE_E5,8, NOTE_FS5,8, NOTE_E5,8, NOTE_D5,8,
+   
+  REST,8, NOTE_A4,8, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,8, //29
+  REST,8, NOTE_CS5,8, NOTE_B4,8, NOTE_A4,-4, REST,4,
+  NOTE_B4,8, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,8, NOTE_A4,4, REST,8,
+  REST,8, NOTE_E5,8, NOTE_E5,8, NOTE_FS5,4, NOTE_E5,-4, 
+  NOTE_D5,2, NOTE_D5,8, NOTE_E5,8, NOTE_FS5,8, NOTE_E5,4, 
+  NOTE_E5,8, NOTE_E5,8, NOTE_FS5,8, NOTE_E5,8, NOTE_A4,8, NOTE_A4,4,
+
+  REST,-4, NOTE_A4,8, NOTE_B4,8, NOTE_CS5,8, NOTE_D5,8, NOTE_B4,8, //35
+  REST,8, NOTE_E5,8, NOTE_FS5,8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_FS5,-8, NOTE_FS5,-8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_E5,-8, NOTE_E5,-8, NOTE_D5,-8, NOTE_CS5,16, NOTE_B4,8, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_D5,4, NOTE_E5,8, NOTE_CS5,-8, NOTE_B4,16, NOTE_A4,4, NOTE_A4,8, 
+
+   NOTE_E5,4, NOTE_D5,2, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16, //40
+  NOTE_FS5,-8, NOTE_FS5,-8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_A5,4, NOTE_CS5,8, NOTE_D5,-8, NOTE_CS5,16, NOTE_B4,8, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_D5,4, NOTE_E5,8, NOTE_CS5,-8, NOTE_B4,16, NOTE_A4,4, NOTE_A4,8,  
+  NOTE_E5,4, NOTE_D5,2, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+   
+  NOTE_FS5,-8, NOTE_FS5,-8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16, //45
+  NOTE_A5,4, NOTE_CS5,8, NOTE_D5,-8, NOTE_CS5,16, NOTE_B4,8, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_D5,4, NOTE_E5,8, NOTE_CS5,-8, NOTE_B4,16, NOTE_A4,4, NOTE_A4,8,  
+  NOTE_E5,4, NOTE_D5,2, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_FS5,-8, NOTE_FS5,-8, NOTE_E5,-4, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16, //45
+   
+  NOTE_A5,4, NOTE_CS5,8, NOTE_D5,-8, NOTE_CS5,16, NOTE_B4,8, NOTE_A4,16, NOTE_B4,16, NOTE_D5,16, NOTE_B4,16,
+  NOTE_D5,4, NOTE_E5,8, NOTE_CS5,-8, NOTE_B4,16, NOTE_A4,4, NOTE_A4,8, 
+
+  NOTE_E5,4, NOTE_D5,2, REST,4
+)NOTES";
+
+// Playback task handle
+TaskHandle_t songTaskHandle = NULL;
+volatile bool songPlaying = false;
+
+// ---------- Helpers ----------
+void startAP() {
+  const char* apName = "ESP32-AP";
+  WiFi.softAP(apName);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("Started AP ");
+  Serial.print(apName);
+  Serial.print(" IP: ");
+  Serial.println(ip.toString());
+}
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long start = millis();
+  while (millis() - start < 8000) {
+    if (WiFi.status() == WL_CONNECTED) break;
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi failed, starting AP");
+    startAP();
+  }
+}
+
+// Set all LEDs to color scaled by brightness (0-255)
+void setStripColor(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
+  float scale = brightness / 255.0f;
+  uint8_t sr = (uint8_t)(r * scale);
+  uint8_t sg = (uint8_t)(g * scale);
+  uint8_t sb = (uint8_t)(b * scale);
+  for (int i = 0; i < NUM_LEDS; ++i) {
+    strip.setPixelColor(i, strip.Color(sr, sg, sb));
+  }
+  strip.show();
+  currentR = r; currentG = g; currentB = b; currentBrightness = brightness;
+  ledsOn = (r!=0 || g!=0 || b!=0) && (brightness>0);
+  mylcd.setCursor(15, 0);
+  mylcd.print(ledsOn ? 'W' : ' ');
+}
+
+// Alarm task
+void alarmTask(void* pv) {
+  const int freq = 2000;
+  const int onMs = 150;
+  const int gapMs = 100;
+  const int pauseMs = 600;
+  while (alarmActive) {
+    buzzer.playTone(freq, onMs);
+    if (!alarmActive) break;
+    vTaskDelay(pdMS_TO_TICKS(gapMs));
+    if (!alarmActive) break;
+    buzzer.playTone(freq, onMs);
+    if (!alarmActive) break;
+    vTaskDelay(pdMS_TO_TICKS(pauseMs));
+  }
+  buzzer.playTone(0, 0);
+  alarmTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+// ---------- Notation parsing ----------
+String trimStr(const String &s) {
+  int a = 0;
+  while (a < (int)s.length() && isspace((unsigned char)s[a])) a++;
+  int b = s.length() - 1;
+  while (b >= 0 && isspace((unsigned char)s[b])) b--;
+  if (b < a) return "";
+  return s.substring(a, b + 1);
+}
+
+int noteNameToFreq(const String &name) {
+  String n = trimStr(name);
+  if (n == "REST") return REST;
+  // compare known names
+  #define CHECK(name) if (n == #name) return name;
+  CHECK(NOTE_B0) CHECK(NOTE_C1) CHECK(NOTE_CS1) CHECK(NOTE_D1) CHECK(NOTE_DS1) CHECK(NOTE_E1) CHECK(NOTE_F1) CHECK(NOTE_FS1)
+  CHECK(NOTE_G1) CHECK(NOTE_GS1) CHECK(NOTE_A1) CHECK(NOTE_AS1) CHECK(NOTE_B1) CHECK(NOTE_C2) CHECK(NOTE_CS2) CHECK(NOTE_D2)
+  CHECK(NOTE_DS2) CHECK(NOTE_E2) CHECK(NOTE_F2) CHECK(NOTE_FS2) CHECK(NOTE_G2) CHECK(NOTE_GS2) CHECK(NOTE_A2) CHECK(NOTE_AS2)
+  CHECK(NOTE_B2) CHECK(NOTE_C3) CHECK(NOTE_CS3) CHECK(NOTE_D3) CHECK(NOTE_DS3) CHECK(NOTE_E3) CHECK(NOTE_F3) CHECK(NOTE_FS3)
+  CHECK(NOTE_G3) CHECK(NOTE_GS3) CHECK(NOTE_A3) CHECK(NOTE_AS3) CHECK(NOTE_B3) CHECK(NOTE_C4) CHECK(NOTE_CS4) CHECK(NOTE_D4)
+  CHECK(NOTE_DS4) CHECK(NOTE_E4) CHECK(NOTE_F4) CHECK(NOTE_FS4) CHECK(NOTE_G4) CHECK(NOTE_GS4) CHECK(NOTE_A4) CHECK(NOTE_AS4)
+  CHECK(NOTE_B4) CHECK(NOTE_C5) CHECK(NOTE_CS5) CHECK(NOTE_D5) CHECK(NOTE_DS5) CHECK(NOTE_E5) CHECK(NOTE_F5) CHECK(NOTE_FS5)
+  CHECK(NOTE_G5) CHECK(NOTE_GS5) CHECK(NOTE_A5) CHECK(NOTE_AS5) CHECK(NOTE_B5) CHECK(NOTE_C6) CHECK(NOTE_CS6) CHECK(NOTE_D6)
+  CHECK(NOTE_DS6) CHECK(NOTE_E6) CHECK(NOTE_F6) CHECK(NOTE_FS6) CHECK(NOTE_G6) CHECK(NOTE_GS6) CHECK(NOTE_A6) CHECK(NOTE_AS6)
+  CHECK(NOTE_B6) CHECK(NOTE_C7) CHECK(NOTE_CS7) CHECK(NOTE_D7) CHECK(NOTE_DS7) CHECK(NOTE_E7) CHECK(NOTE_F7) CHECK(NOTE_FS7)
+  CHECK(NOTE_G7) CHECK(NOTE_GS7) CHECK(NOTE_A7) CHECK(NOTE_AS7) CHECK(NOTE_B7) CHECK(NOTE_C8) CHECK(NOTE_CS8) CHECK(NOTE_D8)
+  CHECK(NOTE_DS8)
+  #undef CHECK
+  return REST;
+}
+
+void parseNotationToVectors(const char* notation, std::vector<int> &freqs, std::vector<int> &durs) {
+  String s = String(notation);
+  // remove // comments
+  int idx = 0;
+  while ((idx = s.indexOf("//")) >= 0) {
+    int eol = s.indexOf('\n', idx);
+    if (eol < 0) eol = s.length();
+    s.remove(idx, eol - idx);
+  }
+  // split by commas into tokens
+  std::vector<String> tokens;
+  int start = 0;
+  while (start < s.length()) {
+    int comma = s.indexOf(',', start);
+    if (comma < 0) comma = s.length();
+    String tok = s.substring(start, comma);
+    tok.trim();
+    if (tok.length() > 0) tokens.push_back(tok);
+    start = comma + 1;
+  }
+  
+  // Calculate whole note duration correctly
+  int wholenote = (60000 * 4) / tempo;
+  
+  // tokens in pairs: note, value
+  for (size_t i = 0; i + 1 < tokens.size(); i += 2) {
+    String noteTok = tokens[i];
+    String valTok = tokens[i+1];
+    noteTok.trim(); valTok.trim();
+    if (noteTok.length() == 0 || valTok.length() == 0) continue;
+    int freq = noteNameToFreq(noteTok);
+    int divider = valTok.toInt();
+    if (divider == 0) divider = 4;
+    
+    int noteDuration;
+    if (divider > 0) {
+      // regular note
+      noteDuration = wholenote / divider;
+    } else if (divider < 0) {
+      // dotted notes (negative durations)
+      noteDuration = wholenote / abs(divider);
+      noteDuration *= 1.5;
+    }
+    
+    freqs.push_back(freq);
+    durs.push_back(noteDuration);
+  }
+}
+
+// Map frequency to hue (0..360) using log mapping
+uint16_t freqToHue(int freq) {
+  if (freq <= 0) return 0;
+  float f = (float)freq;
+  float logf = log(f);
+  const float minL = log(65.0f);
+  const float maxL = log(2000.0f);
+  float t = (logf - minL) / (maxL - minL);
+  if (t < 0) t = 0; if (t > 1) t = 1;
+  return (uint16_t)(t * 360.0f);
+}
+
+// HSV->RGB (v=1, s=1)
+void hsvToRgb(uint16_t h, uint8_t &r, uint8_t &g, uint8_t &b) {
+  float hf = (float)h / 60.0f;
+  int i = floor(hf);
+  float f = hf - i;
+  float q = 1.0f - f;
+  float t = f;
+  float rf=0, gf=0, bf=0;
+  switch (i % 6) {
+    case 0: rf=1; gf=t; bf=0; break;
+    case 1: rf=q; gf=1; bf=0; break;
+    case 2: rf=0; gf=1; bf=t; break;
+    case 3: rf=0; gf=q; bf=1; break;
+    case 4: rf=t; gf=0; bf=1; break;
+    case 5: rf=1; gf=0; bf=q; break;
+  }
+  r = (uint8_t)(rf * 255.0f);
+  g = (uint8_t)(gf * 255.0f);
+  b = (uint8_t)(bf * 255.0f);
+}
+
+// Map frequency to servo angle with dramatic range and optional overshoot
+int freqToServoAngleDramatic(int freq, int minAngle = 10, int maxAngle = 170, float drama = 1.4f) {
+  if (freq <= 0) return 90; // REST -> center
+  float f = (float)freq;
+  float logf = log(f);
+  const float minL = log(65.0f);
+  const float maxL = log(2000.0f);
+  float t = (logf - minL) / (maxL - minL);
+  if (t < 0) t = 0; if (t > 1) t = 1;
+  // amplify extremes for drama
+  float centered = (t - 0.5f) * 2.0f; // -1..1
+  centered = pow(fabs(centered), 0.9f) * (centered < 0 ? -1.0f : 1.0f); // slight curve
+  centered *= drama; // increase swing
+  float mid = 0.5f;
+  float mapped = mid + centered * 0.5f; // map back to 0..1 with amplified swing
+  if (mapped < 0) mapped = 0; if (mapped > 1) mapped = 1;
+  return minAngle + (int)round(mapped * (maxAngle - minAngle));
+}
+
+// Playback task with servo and LED effects optimized for speed
+void playParsedSongTask(void* pv) {
+  std::vector<int> freqs;
+  std::vector<int> durs;
+  parseNotationToVectors(rawNotation, freqs, durs);
+  songPlaying = true;
+
+  // Attach servo if not attached
+  if (!servoAttached) {
+    beatServo.attach(SERVO_PIN, 500, 2400);
+    servoAttached = true;
+    beatServo.write(90);
+    delay(50);
+  }
+
+// Show first lyric immediately
+currentLyric = String(lyricLines[0]);
+scrollPos = 0;
+lastScrollTime = millis();
+
+mylcd.clear();
+mylcd.setCursor(0, 0);
+
+if (currentLyric.length() <= 16) {
+    mylcd.print(currentLyric);
+} else {
+    mylcd.print(currentLyric.substring(0, 16));
+}
+
+  for (size_t i = 0; i < freqs.size() && songPlaying; ++i) {
+    int f = freqs[i];
+    int d = durs[i];
+    // ---------------- LYRIC SYNC USING PAUSES ----------------
+if (f == 0) {  // REST detected → advance lyric
+    lyricIndex++;
+    if (lyricIndex < (sizeof(lyricLines) / sizeof(lyricLines[0]))) {
+        currentLyric = String(lyricLines[lyricIndex]);
+        scrollPos = 0;
+        lastScrollTime = millis();
+
+        mylcd.clear();
+        mylcd.setCursor(0, 0);
+
+        // If it fits, print static
+        if (currentLyric.length() <= 16) {
+            mylcd.print(currentLyric);
+        } else {
+            // Print first 16 chars before scrolling begins
+            mylcd.print(currentLyric.substring(0, 16));
+        }
+    }
+}
+
+// ---------------- SCROLLING LOGIC (OPTION D) ----------------
+if (currentLyric.length() > 16) {
+    unsigned long now = millis();
+
+    // Scroll speed based on tempo (faster tempo = faster scroll)
+    int scrollDelay = max(60, 60000 / tempo / 2);
+
+    if (now - lastScrollTime >= scrollDelay) {
+        lastScrollTime = now;
+
+        scrollPos++;
+        if (scrollPos > currentLyric.length()) {
+            scrollPos = 0;  // loop scroll
+        }
+
+        mylcd.clear();
+        mylcd.setCursor(0, 0);
+
+        String window = currentLyric.substring(scrollPos) +
+                        "   " +
+                        currentLyric.substring(0, scrollPos);
+
+        mylcd.print(window.substring(0, 16));
+    }
+}
+    if (d <= 0) d = 100;
+
+    // Calculate servo angle - map to actual note range in the song
+    int servoAngle = 90; // default center
+    if (f != REST) {
+      // The song uses notes from A4 (440Hz) to A5 (880Hz) approximately
+      // Map this range dramatically to full servo range
+      const int minFreq = 400;  // Below lowest note
+      const int maxFreq = 900;  // Above highest note
+      
+      // Linear mapping with clamping
+      float t = (float)(f - minFreq) / (float)(maxFreq - minFreq);
+      t = constrain(t, 0.0f, 1.0f);
+      
+      // Apply dramatic curve - makes movements more exaggerated
+      t = pow(t, 0.7f); // slightly favor higher angles
+      
+      servoAngle = 10 + (int)(t * 160.0f); // FULL range 10-170 degrees
+      
+      // Debug output
+      Serial.print("Freq: "); Serial.print(f); 
+      Serial.print(" Angle: "); Serial.println(servoAngle);
+    }
+    
+    // Move servo immediately (no smoothing to save time)
+    beatServo.write(servoAngle);
+
+    // LED color change based on frequency
+    if (f != REST) {
+      uint16_t hue = freqToHue(f);
+      uint8_t R,G,B;
+      hsvToRgb(hue, R, G, B);
+      setStripColor(R, G, B, currentBrightness);
+      
+      // Play note for 90% of duration
+      int playDuration = d * 0.9;
+      buzzer.playTone(f, playDuration);
+      delay(playDuration);
+      buzzer.playTone(0, 0);
+      delay(d - playDuration);
+    } else {
+      setStripColor(0, 0, 0, 0);
+      delay(d);
+    }
+  }
+
+  // Cleanup - dramatic sweep before centering
+  if (servoAttached) {
+    beatServo.write(10);
+    delay(100);
+    beatServo.write(170);
+    delay(100);
+    beatServo.write(90);
+    delay(100);
+    beatServo.detach();
+    servoAttached = false;
+  }
+
+  setStripColor(0,0,0,0);
+  buzzer.playTone(0,0);
+  songPlaying = false;
+  songTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+bool startPlayingParsedSong() {
+  if (songTaskHandle != NULL) return false;
+  BaseType_t ok = xTaskCreatePinnedToCore(playParsedSongTask, "playParsed", 8192, NULL, 1, &songTaskHandle, 1);
+  return ok == pdPASS;
+}
+
+void stopPlayingParsedSong() {
+  if (songTaskHandle != NULL) {
+    songPlaying = false;
+    // let task exit
+  }
+}
+
+// ---------- Web UI (built with String concatenation) ----------
+void handleRoot() {
+  String html;
+  html.reserve(32000);
+  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>ESP32 Sensor - Color Wheel & Songs</title>";
+  html += "<link href='https://fonts.googleapis.com/css2?family=Fredoka+One&display=swap' rel='stylesheet'>";
+  html += "<style>:root{--bg:#f7f9fc;--card:#fff;--accent:#0078d4;--danger:#ff4d4d}body{font-family:'Fredoka One',Arial,sans-serif;margin:0;background:var(--bg);color:#111}.wrap{max-width:900px;margin:12px auto;padding:12px}.card{background:var(--card);border-radius:12px;padding:12px 14px;box-shadow:0 8px 24px rgba(0,0,0,0.06)}h2{margin:0 0 8px 0;font-size:20px}.grid{display:flex;gap:12px;flex-wrap:wrap}.panel{background:#fff;border-radius:10px;padding:10px;box-shadow:0 6px 18px rgba(0,0,0,0.04);flex:1 1 300px;min-width:220px;position:relative}.muted{color:#666;font-size:13px}.big{font-size:28px;font-weight:700}.controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}button{appearance:none;border:0;background:var(--accent);color:#fff;padding:10px 12px;border-radius:10px;font-weight:700;cursor:pointer}.small{padding:8px 10px;font-size:14px}.color-swatch{width:36px;height:36px;border-radius:6px;border:1px solid #ccc;display:inline-block;vertical-align:middle}.alarm-wrap{height:0;overflow:hidden;display:flex;justify-content:center;align-items:center;transition:height .22s ease}.alarm-wrap.show{height:160px}.alarm-circle{width:120px;height:120px;border-radius:50%;background:var(--danger);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;box-shadow:0 0 20px rgba(255,77,77,0.6)}@media (max-width:520px){.grid{flex-direction:column}.panel{min-width:unset}canvas{width:100% !important;height:auto !important}.alarm-wrap.show{height:200px}.alarm-circle{width:160px;height:160px;font-size:18px}}.wheel-wrap{display:flex;flex-direction:column;align-items:center;gap:8px}.wheel-canvas{touch-action:none;border-radius:8px}.row{display:flex;align-items:center;gap:8px}.slider{width:100%}.icon{width:26px;height:26px;vertical-align:middle;margin-right:6px}</style></head><body>";
+  html += "<div class='wrap'><div class='card'><h2>ESP32 Sensor</h2><div class='grid'>";
+
+  // Left panel: readings + icons + alarm area
+  html += "<div class='panel'>";
+  html += "<div style='display:flex;align-items:center;gap:12px'>";
+  html += "<svg class='icon' viewBox='0 0 24 24' fill='none' stroke='#e74c3c' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><path d='M14 14.76V5a2 2 0 10-4 0v9.76a4 4 0 104 0z'></path></svg>";
+  html += "<div><div class='muted'>Temperature</div><div class='big'><span id='temp'>--</span> <span id='unit'>F</span></div></div></div>";
+  html += "<div style='height:8px'></div>";
+  html += "<div style='display:flex;align-items:center;gap:12px'>";
+  html += "<svg class='icon' viewBox='0 0 24 24' fill='none' stroke='#3498db' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><path d='M12 2s6 6.5 6 10a6 6 0 11-12 0c0-3.5 6-10 6-10z'></path></svg>";
+  html += "<div><div class='muted'>Humidity</div><div class='big'><span id='hum'>--</span></div></div></div>";
+  html += "<div id='alarmWrap' class='alarm-wrap'><div id='alarmCircle' class='alarm-circle'>High Humidity</div></div>";
+  html += "</div>";
+
+  // Right panel: color wheel + controls + song buttons
+  html += "<div class='panel'><div class='muted'>Color Wheel</div><div class='wheel-wrap' style='margin-top:8px'>";
+  html += "<canvas id='wheel' class='wheel-canvas' width='320' height='320'></canvas>";
+  html += "<div class='row' style='width:100%;align-items:center'><div style='display:flex;align-items:center;gap:8px'><div id='swatch' class='color-swatch'></div><div id='rgbText' class='muted'>R:255 G:255 B:255</div></div>";
+  html += "<div style='margin-left:auto;display:flex;gap:8px;align-items:center'><div class='muted'>Brightness</div><input id='brightness' class='slider' type='range' min='0' max='255' value='150' /><div id='brightnessVal' style='width:36px;text-align:center'>150</div></div></div>";
+  html += "<div style='width:100%;margin-top:8px;display:flex;gap:8px;flex-wrap:wrap'>";
+  html += "<button class='small preset' data-hex='#FFFFFF'>White</button>";
+  html += "<button class='small preset' data-hex='#FF0000'>Red</button>";
+  html += "<button class='small preset' data-hex='#00FF00'>Green</button>";
+  html += "<button class='small preset' data-hex='#0000FF'>Blue</button>";
+  html += "<button class='small preset' data-hex='#FF9900'>Warm</button>";
+  html += "<button id='turnOff' class='small' style='background:#999'>Off</button>";
+  html += "</div>";
+  html += "<div style='width:100%;margin-top:10px;display:flex;gap:8px'><button id='toggleUnit' class='small'>Toggle °F/°C</button><button id='toggleLed' class='small'>Toggle LEDs</button><button id='buzzerBtn' class='small'>Beep</button></div>";
+  html += "<div style='width:100%;margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'><button id='playLocal' class='small'>Play Local Song</button><button id='stopLocal' class='small' style='background:#999'>Stop Song</button></div>";
+  html += "</div></div></div></div></div>";
+
+  // JS (minified-ish for safety inside C++ string)
+  html += "<script>";
+  html += "const wheel=document.getElementById('wheel');const ctx=wheel.getContext('2d');let wheelSize=Math.min(wheel.width,wheel.height);let cx=wheel.width/2,cy=wheel.height/2,radius=wheelSize/2-4;let dragging=false;const SEND_THROTTLE_MS=120;";
+  html += "function drawWheel(){const image=ctx.createImageData(wheel.width,wheel.height);for(let y=0;y<wheel.height;y++){for(let x=0;x<wheel.width;x++){const dx=x-cx;const dy=y-cy;const d=Math.sqrt(dx*dx+dy*dy);const idx=(y*wheel.width+x)*4;if(d<=radius){let angle=Math.atan2(dy,dx);if(angle<0)angle+=Math.PI*2;const hue=angle/(Math.PI*2);const sat=d/radius;const h=hue*6;const i=Math.floor(h);const f=h-i;let r=0,g=0,b=0;switch(i%6){case 0:r=1;g=f;b=0;break;case 1:r=1-f;g=1;b=0;break;case 2:r=0;g=1;b=f;break;case 3:r=0;g=1-f;b=1;break;case 4:r=f;g=0;b=1;break;case 5:r=1;g=0;b=1-f;break;}r=(r*sat+(1-sat)*1)*255;g=(g*sat+(1-sat)*1)*255;b=(b*sat+(1-sat)*1)*255;image.data[idx]=Math.round(r);image.data[idx+1]=Math.round(g);image.data[idx+2]=Math.round(b);image.data[idx+3]=255;}else{image.data[idx]=255;image.data[idx+1]=255;image.data[idx+2]=255;image.data[idx+3]=0;}}}ctx.putImageData(image,0,0);}drawWheel();";
+  html += "function pickColorAt(x,y){const dx=x-cx;const dy=y-cy;const d=Math.sqrt(dx*dx+dy*dy);if(d>radius)return null;let angle=Math.atan2(dy,dx);if(angle<0)angle+=Math.PI*2;const hue=angle/(Math.PI*2);const sat=d/radius;const h=hue*6;const i=Math.floor(h);const f=h-i;let r=0,g=0,b=0;switch(i%6){case 0:r=1;g=f;b=0;break;case 1:r=1-f;g=1;b=0;break;case 2:r=0;g=1;b=f;break;case 3:r=0;g=1-f;b=1;break;case 4:r=f;g=0;b=1;break;case 5:r=1;g=0;b=1-f;break;}r=Math.round((r*sat+(1-sat)*1)*255);g=Math.round((g*sat+(1-sat)*1)*255);b=Math.round((b*sat+(1-sat)*1)*255);return {r,g,b};}";
+  html += "let selX=cx,selY=cy;function drawSelector(){drawWheel();ctx.beginPath();ctx.arc(selX,selY,8,0,Math.PI*2);ctx.lineWidth=3;ctx.strokeStyle='#fff';ctx.stroke();const c=pickColorAt(selX,selY)||{r:255,g:255,b:255};ctx.beginPath();ctx.arc(selX,selY,6,0,Math.PI*2);ctx.fillStyle=`rgb(${c.r},${c.g},${c.b})`;ctx.fill();}";
+  html += "function toCanvasPos(evt){const rect=wheel.getBoundingClientRect();let clientX,clientY;if(evt.touches&&evt.touches.length){clientX=evt.touches[0].clientX;clientY=evt.touches[0].clientY;}else{clientX=evt.clientX;clientY=evt.clientY;}const x=(clientX-rect.left)*(wheel.width/rect.width);const y=(clientY-rect.top)*(wheel.height/rect.height);return {x,y};}";
+  html += "function startDrag(evt){evt.preventDefault();dragging=true;const p=toCanvasPos(evt);const c=pickColorAt(p.x,p.y);if(c){selX=p.x;selY=p.y;updateUIandSend(c.r,c.g,c.b);}drawSelector();}";
+  html += "function moveDrag(evt){if(!dragging)return;evt.preventDefault();const p=toCanvasPos(evt);const c=pickColorAt(p.x,p.y);if(c){selX=p.x;selY=p.y;updateUIandSend(c.r,c.g,c.b);drawSelector();}}";
+  html += "function endDrag(evt){dragging=false;}";
+  html += "wheel.addEventListener('mousedown',startDrag);window.addEventListener('mousemove',moveDrag);window.addEventListener('mouseup',endDrag);wheel.addEventListener('touchstart',startDrag,{passive:false});window.addEventListener('touchmove',moveDrag,{passive:false});window.addEventListener('touchend',endDrag);";
+  html += "let lastSendTime=0;function sendColorThrottled(r,g,b,br){const now=Date.now();if(now-lastSendTime>SEND_THROTTLE_MS){lastSendTime=now;sendColor(r,g,b,br);}else{setTimeout(()=>{lastSendTime=Date.now();sendColor(r,g,b,br);},SEND_THROTTLE_MS);}}";
+  html += "async function sendColor(r,g,b,br){try{await fetch(`/api/color?r=${r}&g=${g}&b=${b}&br=${br}`);}catch(e){console.error('sendColor error',e);} }";
+  html += "function updateUIandSend(r,g,b){const br=parseInt(document.getElementById('brightness').value);document.getElementById('swatch').style.background=`rgb(${r},${g},${b})`;document.getElementById('rgbText').textContent=`R:${r} G:${g} B:${b}`;sendColorThrottled(r,g,b,br);}";
+
+  html += "document.querySelectorAll('button.preset').forEach(btn=>{btn.addEventListener('click',()=>{const hex=btn.getAttribute('data-hex');const rgb=hexToRgb(hex);document.getElementById('swatch').style.background=hex;document.getElementById('rgbText').textContent=`R:${rgb.r} G:${rgb.g} B:${rgb.b}`;sendColorThrottled(rgb.r,rgb.g,rgb.b,parseInt(document.getElementById('brightness').value));});});";
+  html += "document.getElementById('brightness').addEventListener('input',(e)=>{const v=e.target.value;document.getElementById('brightnessVal').textContent=v;sendColorThrottled(currentR,currentG,currentB,parseInt(v));});";
+  html += "document.getElementById('turnOff').addEventListener('click',()=>{sendColorThrottled(0,0,0,0);document.getElementById('swatch').style.background='#000';document.getElementById('rgbText').textContent='R:0 G:0 B:0';});";
+  html += "document.getElementById('toggleUnit').addEventListener('click',async()=>{await fetch('/api/toggle',{method:'POST'});fetchReadings();});";
+  html += "document.getElementById('toggleLed').addEventListener('click',async()=>{await fetch('/api/led/toggle',{method:'POST'});fetchReadings();});";
+  html += "document.getElementById('buzzerBtn').addEventListener('click',async()=>{await fetch('/api/buzzer',{method:'POST'});});";
+  html += "document.getElementById('playLocal').addEventListener('click',async()=>{await fetch('/api/playlocal');});";
+  html += "document.getElementById('stopLocal').addEventListener('click',async()=>{await fetch('/api/stoplocal');});";
+  html += "function hexToRgb(hex){hex=hex.replace('#','');const bigint=parseInt(hex,16);return {r:(bigint>>16)&255,g:(bigint>>8)&255,b:bigint&255};}";
+  html += "async function fetchReadings(){try{const r=await fetch('/api/readings');const j=await r.json();document.getElementById('temp').textContent=j.tempDisplay.toFixed(1);document.getElementById('hum').textContent=j.humidity.toFixed(1)+' %';document.getElementById('unit').textContent=j.unit;document.getElementById('swatch').style.background=j.hex;document.getElementById('rgbText').textContent=`R:${j.color.r} G:${j.color.g} B:${j.color.b}`;document.getElementById('brightness').value=j.brightness;document.getElementById('brightnessVal').textContent=j.brightness;currentR=j.color.r;currentG=j.color.g;currentB=j.color.b;currentBrightness=j.brightness;const alarmWrap=document.getElementById('alarmWrap');if(j.alarmActive){alarmWrap.classList.add('show');}else{alarmWrap.classList.remove('show');}if(!(j.color.r==255&&j.color.g==255&&j.color.b==255)){const hsv=rgbToHsv(j.color.r,j.color.g,j.color.b);const angle=hsv.h*2*Math.PI;const sat=hsv.s;selX=cx+Math.cos(angle)*sat*radius;selY=cy+Math.sin(angle)*sat*radius;}else{selX=cx;selY=cy;}drawSelector();}catch(e){console.error(e);}}";
+  html += "function rgbToHsv(r,g,b){r/=255;g/=255;b/=255;const max=Math.max(r,g,b),min=Math.min(r,g,b);const d=max-min;let h=0;if(d==0)h=0;else if(max==r)h=(g-b)/d+(g<b?6:0);else if(max==g)h=(b-r)/d+2;else h=(r-g)/d+4;h/=6;const s=max==0?0:d/max;const v=max;return {h,s,v};}";
+  html += "drawSelector();fetchReadings();setInterval(fetchReadings,1500);";
+  html += "</script></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// JSON readings
+void sendJsonReadings() {
+  float tempC = lastTempC;
+  float hum = lastHum;
+  float tempF = NAN;
+  if (!isnan(tempC)) tempF = tempC * 9.0 / 5.0 + 32.0;
+  float tempDisplay = showFahrenheit ? tempF : tempC;
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  auto twoHex = [](uint8_t v)->String {
+    char buf[3];
+    sprintf(buf, "%02X", v);
+    return String(buf);
+  };
+  String hexFull = "#" + twoHex(currentR) + twoHex(currentG) + twoHex(currentB);
+
+  String json = "{";
+  json += "\"tempC\":" + String(isnan(tempC) ? 0.0 : tempC, 2) + ",";
+  json += "\"tempF\":" + String(isnan(tempF) ? 0.0 : tempF, 2) + ",";
+  json += "\"tempDisplay\":" + String(isnan(tempDisplay) ? 0.0 : tempDisplay, 2) + ",";
+  json += "\"humidity\":" + String(isnan(hum) ? 0.0 : hum, 2) + ",";
+  json += "\"unit\":\"" + String(showFahrenheit ? "F" : "C") + "\",";
+  json += "\"ledOn\":" + String(ledsOn ? "true" : "false") + ",";
+  json += "\"color\":{";
+  json += "\"r\":" + String(currentR) + ",";
+  json += "\"g\":" + String(currentG) + ",";
+  json += "\"b\":" + String(currentB) + "},";
+  json += "\"hex\":\"" + hexFull + "\",";
+  json += "\"brightness\":" + String(currentBrightness) + ",";
+  json += "\"alarmActive\":" + String(alarmActive ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// Toggle F/C
+void handleToggle() {
+  showFahrenheit = !showFahrenheit;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json = "{\"unit\":\"" + String(showFahrenheit ? "F" : "C") + "\"}";
+  server.send(200, "application/json", json);
+}
+
+// Toggle LEDs on/off
+void handleLedToggle() {
+  if (ledsOn) {
+    setStripColor(0,0,0,0);
+  } else {
+    setStripColor(currentR, currentG, currentB, currentBrightness);
+  }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String json = "{\"ledOn\":" + String(ledsOn ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+// Buzzer trigger
+void handleBuzzerTrigger() {
+  const int freq = 2000;
+  const int onMs = 100;
+  const int offMs = 100;
+  for (int i = 0; i < 5; ++i) {
+    buzzer.playTone(freq, onMs);
+    delay(offMs);
+  }
+  buzzer.playTone(0, 0);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"started\":true}");
+}
+
+// Set color via query params: /api/color?r=R&g=G&b=B&br=BR
+void handleColor() {
+  String rs = server.arg("r");
+  String gs = server.arg("g");
+  String bs = server.arg("b");
+  String brs = server.arg("br");
+  if (rs.length() && gs.length() && bs.length()) {
+    int r = constrain(rs.toInt(), 0, 255);
+    int g = constrain(gs.toInt(), 0, 255);
+    int b = constrain(bs.toInt(), 0, 255);
+    int br = brs.length() ? constrain(brs.toInt(), 0, 255) : currentBrightness;
+    setStripColor((uint8_t)r, (uint8_t)g, (uint8_t)b, (uint8_t)br);
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  server.send(400, "application/json", "{\"error\":\"missing params\"}");
+}
+
+// Set brightness via /api/brightness?b=VAL
+void handleBrightness() {
+  String bs = server.arg("b");
+  if (bs.length()) {
+    int br = constrain(bs.toInt(), 0, 255);
+    setStripColor(currentR, currentG, currentB, (uint8_t)br);
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  server.send(400, "application/json", "{\"error\":\"missing param b\"}");
+}
+
+// Local song endpoints
+void handlePlayLocal() {
+  if (startPlayingParsedSong()) {
+    server.send(200, "application/json", "{\"started\":true}");
+  } else {
+    server.send(409, "application/json", "{\"error\":\"already playing\"}");
+  }
+}
+void handleStopLocal() {
+  stopPlayingParsedSong();
+  server.send(200, "application/json", "{\"stopped\":true}");
+}
+
+// Button debounce
+void handleButton() {
+  bool raw = digitalRead(BUTTON_PIN);
+  if (raw != buttonLastRead) {
+    buttonLastChangeMs = millis();
+    buttonLastRead = raw;
+    return;
+  }
+  if ((millis() - buttonLastChangeMs) >= DEBOUNCE_MS && raw != buttonStableState) {
+    buttonStableState = raw;
+    if (buttonStableState == LOW) {
+      showFahrenheit = !showFahrenheit;
+      Serial.print("Button toggled unit -> ");
+      Serial.println(showFahrenheit ? "F" : "C");
+      mylcd.setCursor(12, 0);
+      mylcd.print(showFahrenheit ? 'F' : 'C');
+    }
+  }
+}
+
+// ---------- Setup & loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  mylcd.init();
+  mylcd.backlight();
+  mylcd.clear();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(DHT11PIN, INPUT_PULLUP);
+
+  strip.begin();
+  strip.setBrightness(currentBrightness);
+  setStripColor(currentR, currentG, currentB, currentBrightness);
+
+  buzzer.setTimbre(30);
+  buzzer.playTone(0,0);
+
+  // Servo: attach here so it's ready; will be detached after song for less jitter
+  beatServo.setPeriodHertz(50);
+  beatServo.attach(SERVO_PIN, 500, 2400);
+  servoAttached = true;
+  beatServo.write(90);
+
+  connectWiFi();
+
+  // Web handlers
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/readings", HTTP_GET, [](){ sendJsonReadings(); });
+  server.on("/api/toggle", HTTP_POST, [](){ handleToggle(); });
+  server.on("/api/led/toggle", HTTP_POST, [](){ handleLedToggle(); });
+  server.on("/api/buzzer", HTTP_POST, [](){ handleBuzzerTrigger(); });
+  server.on("/api/color", HTTP_GET, [](){ handleColor(); });
+  server.on("/api/brightness", HTTP_GET, [](){ handleBrightness(); });
+  server.on("/api/playlocal", HTTP_GET, [](){ handlePlayLocal(); });
+  server.on("/api/stoplocal", HTTP_GET, [](){ handleStopLocal(); });
+  server.begin();
+  Serial.println("HTTP server started");
+
+  mylcd.setCursor(0,0);
+  mylcd.print("Temp: --.- F   ");
+  mylcd.setCursor(0,1);
+  mylcd.print("Hum:  --.- %   ");
+}
+
+void loop() {
+  server.handleClient();
+  handleButton();
+
+  if (millis() - lastSensorMs >= SENSOR_INTERVAL) {
+    lastSensorMs = millis();
+    int chk = DHT11.read(DHT11PIN);
+    if (chk != 0) {
+      Serial.print("DHT11 read error code: ");
+      Serial.println(chk);
+      mylcd.setCursor(0,0);
+      mylcd.print("Temp: read err   ");
+      mylcd.setCursor(0,1);
+      mylcd.print("Hum:  read err   ");
+    } else {
+      int t = DHT11.temperature;
+      int h = DHT11.humidity;
+      if (h < 0) h = 0; if (h > 100) h = 100;
+      if (t < -40) t = -40; if (t > 80) t = 80;
+      lastTempC = (float)t;
+      lastHum = (float)h;
+
+      float tempDisplay = showFahrenheit ? (lastTempC * 9.0 / 5.0 + 32.0) : lastTempC;
+      char line1[17], line2[17];
+      snprintf(line1, sizeof(line1), "Temp:%6.1f %c   ", tempDisplay, showFahrenheit ? 'F' : 'C');
+      snprintf(line2, sizeof(line2), "Hum: %6.1f %%   ", lastHum);
+      mylcd.setCursor(0,0); mylcd.print(line1);
+      mylcd.setCursor(0,1); mylcd.print(line2);
+
+      Serial.print("TempC: "); Serial.print(lastTempC);
+      Serial.print(" Disp: "); Serial.print(tempDisplay);
+      Serial.print(showFahrenheit ? " F" : " C");
+      Serial.print(" Hum: "); Serial.println(lastHum);
+
+      // Alarm control
+      if (lastHum > HUMIDITY_THRESHOLD) {
+        if (!alarmActive) {
+          alarmActive = true;
+          if (alarmTaskHandle == NULL) {
+            xTaskCreatePinnedToCore(alarmTask, "alarmTask", 4096, NULL, 1, &alarmTaskHandle, 1);
+            Serial.println("Alarm task started");
+          }
+        }
+      } else {
+        if (alarmActive) {
+          alarmActive = false;
+          buzzer.playTone(0,0);
+          Serial.println("Alarm stopped (humidity dropped)");
+        }
+      }
+    }
+  }
+
+  delay(5);
+}
