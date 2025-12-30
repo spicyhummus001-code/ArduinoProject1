@@ -466,6 +466,7 @@ void playParsedSongTask(void* pv) {
   std::vector<int> durs;
   parseNotationToVectors(rawNotation, freqs, durs);
   songPlaying = true;
+  lyricIndex = 0;
 
   // Attach servo if not attached
   if (!servoAttached) {
