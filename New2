@@ -53,9 +53,6 @@ bool servoAttached = false;
 // Web server
 WebServer server(80);
 
-// ------------------- RAW NOTATION -------------------
-String rawNotation = ...
-
 // ---------------- LYRIC SENTENCES (YOU FILL THESE IN) ----------------
 const char* lyricLines[] = {
     "LYRIC 1",
